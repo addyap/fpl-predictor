@@ -124,7 +124,12 @@ def cached_team(team_id: str):
 def cached_entry(team_id: str):
     if not team_id or not team_id.isdigit():
         return {}
-    return data_fetch.fetch_fpl_entry(int(team_id))
+    # Defensive: never let a metadata lookup crash the whole app.
+    try:
+        return data_fetch.fetch_fpl_entry(int(team_id))
+    except Exception as exc:  # noqa: BLE001 - degrade gracefully
+        print(f"[main] cached_entry failed: {exc}")
+        return {}
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
