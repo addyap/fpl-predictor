@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+data/historical_*.csv
+.streamlit/secrets.toml
+.DS_Store
+
+# Editor/tooling symlinks auto-created into the venv (not part of the app)
+.agents/
+.claude/
