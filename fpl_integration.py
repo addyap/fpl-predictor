@@ -640,6 +640,83 @@ def optimal_squad(bootstrap: dict, fixtures: list[dict], budget: float = 100.0, 
     return result
 
 
+def transfer_suggestions(
+    bootstrap: dict,
+    fixtures: list[dict],
+    squad_ids: set[int],
+    weeks: int = 6,
+    n: int = 5,
+) -> pd.DataFrame:
+    """
+    Compare the manager's actual squad to the best available alternatives and
+    recommend the transfers that most improve projected points.
+
+    For each owned player, find the best same-position player you DON'T own
+    (respecting the max-3-per-club rule given the rest of your squad), then rank
+    all such swaps by projection gain. Shows the price delta so you can judge
+    affordability (we can't see your bank balance).
+
+    Columns: out_player, out_team, in_player, in_team, position, gain, cost_delta.
+    Empty frame if no squad is set or no improving swap exists.
+    """
+    cols = ["out_player", "out_team", "in_player", "in_team",
+            "position", "gain", "cost_delta"]
+    players = players_frame(bootstrap)
+    if players.empty or not squad_ids:
+        return pd.DataFrame(columns=cols)
+
+    fdr = fixture_difficulty(bootstrap, fixtures, weeks)
+    ease = {
+        r["team_name"]: (5.0 - r["avg_difficulty"])
+        for _, r in fdr.iterrows() if r["avg_difficulty"] is not None
+    }
+    players = players.copy()
+    players["fixture_ease"] = players["team_name"].map(ease).fillna(2.0)
+    players["proj"] = players["ep_next"] + players["form"] * 0.5 + players["fixture_ease"] * 0.6
+
+    squad = players[players["id"].isin(squad_ids)]
+    if squad.empty:
+        return pd.DataFrame(columns=cols)
+    # Club counts in the current squad (for the 3-per-club rule).
+    club_count = squad["team_name"].value_counts().to_dict()
+    available = players[(~players["id"].isin(squad_ids)) & (players["status"] == "a")]
+
+    swaps = []
+    for _, out_p in squad.iterrows():
+        pos = out_p["position"]
+        cands = available[available["position"] == pos].sort_values("proj", ascending=False)
+        for _, in_p in cands.iterrows():
+            if in_p["proj"] <= out_p["proj"]:
+                break  # sorted desc, nothing better remains
+            # Club rule: adding in_p removes out_p first.
+            eff = club_count.get(in_p["team_name"], 0)
+            if in_p["team_name"] == out_p["team_name"]:
+                eff -= 1
+            if eff >= 3:
+                continue
+            swaps.append(
+                {
+                    "out_player": out_p["web_name"],
+                    "out_team": out_p["team_name"],
+                    "in_player": in_p["web_name"],
+                    "in_team": in_p["team_name"],
+                    "position": pos,
+                    "gain": round(float(in_p["proj"] - out_p["proj"]), 2),
+                    "cost_delta": round(float(in_p["now_cost"] - out_p["now_cost"]), 1),
+                }
+            )
+            break  # best candidate for this player found
+
+    df = pd.DataFrame(swaps, columns=cols)
+    if df.empty:
+        return df
+    # Best-gain first, then keep each incoming/outgoing player only once — you
+    # can't sign the same target for several slots or sell a player twice.
+    df = df.sort_values("gain", ascending=False)
+    df = df.drop_duplicates(subset="in_player").drop_duplicates(subset="out_player")
+    return df.head(n).reset_index(drop=True)
+
+
 def squad_ids_from_picks(picks_payload: dict) -> set[int]:
     """Extract element (player) ids from an FPL entry/picks payload."""
     if not picks_payload or "picks" not in picks_payload:

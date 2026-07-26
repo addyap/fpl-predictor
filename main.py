@@ -23,18 +23,49 @@ import data_fetch
 import features
 import fpl_integration as fpl
 import model as model_mod
+import tracking
 
 # --------------------------------------------------------------------------- #
 # Page config
 # --------------------------------------------------------------------------- #
 
-st.set_page_config(page_title="FPL Predictor", page_icon="⚽", layout="wide")
+st.set_page_config(
+    page_title="FPL Predictor",
+    page_icon="⚽",
+    layout="wide",
+    initial_sidebar_state="auto",  # collapsed by default on mobile
+)
 
 REFRESH_LEVELS = {
     "Quick (5s)": "quick",
     "Full (20s)": "full",
     "Heavy (2min)": "heavy",
 }
+
+# Responsive tweaks so the app reads well on both phones and desktops.
+_RESPONSIVE_CSS = """
+<style>
+/* Wide, comfortable content on desktop; tight and readable on mobile. */
+@media (max-width: 640px) {
+  .block-container { padding: 1rem 0.8rem 3rem !important; }
+  h1 { font-size: 1.55rem !important; }
+  h2 { font-size: 1.25rem !important; }
+  h3 { font-size: 1.05rem !important; }
+  /* Metric numbers shrink so 3-up rows don't clip on small screens. */
+  [data-testid="stMetricValue"] { font-size: 1.1rem !important; }
+}
+/* Let column rows wrap (stack) when they can't fit, instead of squashing. */
+[data-testid="stHorizontalBlock"] { flex-wrap: wrap; }
+/* Tab labels wrap rather than overflow horizontally. */
+[data-baseweb="tab-list"] { flex-wrap: wrap; }
+/* Wide tables/tickers scroll inside their box; the page never scrolls sideways. */
+[data-testid="stDataFrame"], [data-testid="stTable"] { overflow-x: auto; }
+</style>
+"""
+
+
+def inject_css():
+    st.markdown(_RESPONSIVE_CSS, unsafe_allow_html=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -313,6 +344,68 @@ def tab_next_gameweek(trained, history, api_key):
                         "predicted_avg": "Model says (%)", "actual_win_rate": "Actually won (%)",
                     }), use_container_width=True, hide_index=True)
 
+    # ---- Live track record ---------------------------------------------------
+    st.markdown("### 📈 Live track record")
+    boot = cached_bootstrap()
+    gw = fpl.next_gameweek_info(boot).get("next") or fpl.next_gameweek_info(boot).get("current")
+    # Score any predictions whose results are now in.
+    if api_key:
+        tracking.update_results(cached_recent_results(api_key, data_fetch.PL_COMPETITION))
+
+    records = _prediction_records(trained, history, upcoming)
+    log_col, info_col = st.columns([1, 2])
+    with log_col:
+        if gw and st.button(f"📌 Log GW{gw} predictions", use_container_width=True):
+            n = tracking.log_predictions(int(gw), records)
+            if n:
+                st.success(f"Logged {n} new prediction(s).")
+            else:
+                st.info("Predictions for this gameweek are already logged.")
+    with info_col:
+        st.caption(
+            "Log a gameweek's predictions; once results are in they're scored "
+            "automatically, building a real accuracy record over time."
+        )
+
+    summ = tracking.summary()
+    if summ["n_logged"] == 0:
+        st.write("No predictions logged yet. Log a gameweek above to start your track record.")
+    else:
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Predictions logged", summ["n_logged"])
+        t2.metric("Scored so far", summ["n_scored"])
+        t3.metric("Live accuracy", f"{summ['accuracy']*100:.1f}%" if summ["accuracy"] is not None else "—")
+        if not summ["by_gw"].empty:
+            chart = summ["by_gw"].set_index("gw")["accuracy"]
+            st.line_chart(chart, height=220)
+    st.caption(
+        "⚠️ Track record is stored in a local file. On Streamlit Cloud's free tier "
+        "the disk resets on redeploy, so long-term history needs durable storage "
+        "(e.g. Supabase) — ask to wire that up when you want it permanent."
+    )
+
+
+def _prediction_records(trained, history, upcoming) -> list[dict]:
+    """Build loggable prediction records (raw names + result letter + probs)."""
+    known = set(history["home_team"]) | set(history["away_team"])
+    recs = []
+    for _, fx in upcoming.iterrows():
+        home = _match_team_name(fx["home_team"], known)
+        away = _match_team_name(fx["away_team"], known)
+        pred = model_mod.predict_fixture(trained, history, home, away)
+        letter = max(
+            (("H", pred["prob_home"]), ("D", pred["prob_draw"]), ("A", pred["prob_away"])),
+            key=lambda x: x[1],
+        )[0]
+        recs.append(
+            {
+                "home": fx["home_team"], "away": fx["away_team"], "pred": letter,
+                "prob_home": pred["prob_home"], "prob_draw": pred["prob_draw"],
+                "prob_away": pred["prob_away"],
+            }
+        )
+    return recs
+
 
 def _csv_download(df, label: str, filename: str):
     """Render a download button for a DataFrame as CSV (no-op if empty)."""
@@ -449,6 +542,25 @@ def tab_fpl(trained, history, api_key, team_id):
                 "fixture_ease": "Fixture ease",
             }), use_container_width=True, hide_index=True)
         _csv_download(tt, "Download transfer targets (CSV)", "transfer_targets.csv")
+
+    # ---- Personalised transfer suggestions (needs team id) -------------------
+    st.markdown("### ⭐ Your transfer suggestions")
+    if not squad_ids:
+        st.info("Set your FPL team ID in the sidebar to get transfers tailored to *your* squad.")
+    else:
+        sugg = fpl.transfer_suggestions(boot, fixtures, squad_ids, weeks=6, n=5)
+        if sugg.empty:
+            st.write("Your squad already looks strong — no clearly better swap found right now.")
+        else:
+            st.caption("The swaps that most improve your projected points. "
+                       "Δ£ is the price difference (we can't see your bank).")
+            st.dataframe(
+                sugg.rename(columns={
+                    "out_player": "Transfer OUT", "out_team": "From",
+                    "in_player": "Transfer IN", "in_team": "To",
+                    "position": "Pos", "gain": "Proj. gain", "cost_delta": "Δ£m",
+                }), use_container_width=True, hide_index=True)
+            _csv_download(sugg, "Download suggestions (CSV)", "transfer_suggestions.csv")
 
     # ---- Expected goals leaders ----------------------------------------------
     st.markdown("### 📊 Expected goals & assists (xGI leaders)")
@@ -689,6 +801,7 @@ def _render_fdr_radar(fdr: pd.DataFrame, squad_ids, boot):
 # --------------------------------------------------------------------------- #
 
 def main():
+    inject_css()
     st.title("⚽ FPL Predictor")
     st.caption("Premier League outcome model + Fantasy Premier League recommendations.")
 

@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 data/historical_*.csv
+data/predictions.db
 .streamlit/secrets.toml
 .DS_Store
 
