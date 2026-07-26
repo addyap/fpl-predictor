@@ -38,6 +38,18 @@ football_data_org_key = "YOUR_API_KEY_HERE"
 **Settings → Secrets** using the same TOML above. `.streamlit/secrets.toml` is
 gitignored so a real key never reaches GitHub.
 
+## Personal / shareable links
+
+The FPL team id can be passed in the URL, so each person gets their own
+auto-loading link off the same deployed app:
+
+```
+https://<your-app>.streamlit.app/?team=1234567
+```
+
+Priority is URL `?team=` → secrets `fpl_team_id` → blank. Typing an id in the
+sidebar also updates the URL, so you can just bookmark the page.
+
 ## Deploy to Streamlit Community Cloud
 
 1. Push this repo to GitHub.

@@ -246,12 +246,29 @@ def sidebar() -> dict:
         "(sign up takes 2 min)."
     )
 
-    default_team = st.secrets.get("fpl_team_id", "") if hasattr(st, "secrets") else ""
+    # Team ID resolves from the URL (?team=1234567) first, then secrets, then
+    # blank — so everyone can share a personal auto-loading link off one app.
+    url_team = str(st.query_params.get("team", "")).strip()
+    secret_team = str(st.secrets.get("fpl_team_id", "")) if hasattr(st, "secrets") else ""
+    if "team_id_input" not in st.session_state:
+        st.session_state.team_id_input = url_team or secret_team
+
     team_id = st.sidebar.text_input(
         "FPL team ID (optional)",
-        value=str(default_team),
+        key="team_id_input",
         help="The number in your FPL points-page URL. Leave blank for generic picks.",
-    )
+    ).strip()
+
+    # Keep the URL in sync so the current team is bookmarkable / shareable.
+    if team_id:
+        if st.query_params.get("team", "") != team_id:
+            st.query_params["team"] = team_id
+        st.sidebar.caption(
+            "🔗 Your team is saved in this page's URL — **bookmark or share this "
+            "link** and it reloads this team automatically."
+        )
+    elif "team" in st.query_params:
+        del st.query_params["team"]
 
     level_label = st.sidebar.selectbox("Refresh level", list(REFRESH_LEVELS.keys()), index=0)
 
