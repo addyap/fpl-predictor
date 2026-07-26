@@ -120,6 +120,13 @@ def cached_team(team_id: str):
     return data_fetch.fetch_fpl_team(int(team_id)) if team_id.isdigit() else {}
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_entry(team_id: str):
+    if not team_id or not team_id.isdigit():
+        return {}
+    return data_fetch.fetch_fpl_entry(int(team_id))
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def cached_backtest():
     """Out-of-sample backtest of the Premier League model (cached 30 min)."""
@@ -433,9 +440,23 @@ def tab_fpl(trained, history, api_key, team_id):
         picks = cached_team(team_id)
         squad_ids = fpl.squad_ids_from_picks(picks)
         if squad_ids:
-            st.success(f"Personalised to team {team_id} ({len(squad_ids)} players).")
+            entry = cached_entry(team_id)
+            label = entry.get("name", f"team {team_id}")
+            st.success(f"Personalised to **{label}** ({len(squad_ids)} players).")
         else:
-            st.warning(f"Couldn't load squad for team id '{team_id}'. Showing generic picks.")
+            # Distinguish "team exists but no picks yet" from a genuinely bad id.
+            entry = cached_entry(team_id)
+            if entry:
+                mgr = f"{entry.get('player_first_name','')} {entry.get('player_last_name','')}".strip()
+                st.info(
+                    f"✅ Found **{entry.get('name', team_id)}**"
+                    + (f" ({mgr})" if mgr else "")
+                    + ". Your squad isn't published yet — FPL only releases picks once "
+                    "the season's first gameweek deadline passes, so personalised "
+                    "features switch on automatically then. Showing generic picks for now."
+                )
+            else:
+                st.warning(f"Couldn't find an FPL team with id '{team_id}'. Showing generic picks.")
     else:
         st.info("No FPL team id set — showing generic recommendations.")
 

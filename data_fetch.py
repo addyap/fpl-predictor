@@ -374,6 +374,26 @@ def fetch_fpl_fixtures() -> list[dict]:
         return []
 
 
+def fetch_fpl_entry(team_id: int) -> dict:
+    """
+    Fetch a manager's team metadata (name, manager, current event). Works even
+    before the season starts, unlike the picks endpoint. Returns {} on failure
+    or an invalid id, so callers can distinguish "no such team" from "team
+    exists but squad picks aren't published yet (pre-season)".
+    """
+    if not team_id:
+        return {}
+    try:
+        resp = requests.get(
+            f"{FPL_BASE}/entry/{int(team_id)}/", timeout=REQUEST_TIMEOUT
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        print(f"[data_fetch] fetch_fpl_entry({team_id}) failed: {exc}")
+        return {}
+
+
 def fetch_fpl_team(team_id: int) -> dict:
     """
     Fetch a manager's current squad. Uses the latest finished/current event
