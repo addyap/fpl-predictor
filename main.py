@@ -248,6 +248,43 @@ def tab_fpl(trained, api_key, team_id):
     else:
         st.info("No FPL team id set — showing generic recommendations.")
 
+    # Double / Blank gameweek radar
+    st.markdown("### 📅 Double / Blank Gameweeks (next 15 GWs)")
+    gw_info = fpl.next_gameweek_info(boot)
+    if gw_info.get("name"):
+        st.caption(f"Reference gameweek: {gw_info['name']}.")
+    specials = fpl.special_gameweeks(boot, fixtures, ahead=15)
+    if specials.empty:
+        st.write(
+            "No double, triple or blank gameweeks are scheduled in the next 15 GWs. "
+            "These get confirmed by the Premier League as cup rounds cause "
+            "rescheduling — check back through the season."
+        )
+    else:
+        dgw = specials[specials["double_teams"] != "—"]
+        if not dgw.empty:
+            nxt = dgw.iloc[0]
+            st.success(
+                f"⭐ Next Double Gameweek: **GW{nxt['gameweek']}** — "
+                f"{nxt['double_teams']}"
+            )
+        st.dataframe(
+            specials.rename(
+                columns={
+                    "gameweek": "GW", "type": "Type",
+                    "double_teams": "Double (2 games)",
+                    "triple_teams": "Triple (3 games)",
+                    "blank_teams": "Blank (no game)",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "Double/Triple GWs are strong captaincy & transfer targets; Blank GWs "
+            "are when you may need bench cover or a Free Hit chip."
+        )
+
     # Captain pick
     caps = fpl.captain_recommendations(boot, fixtures, weeks=8, top_n=8, squad_ids=squad_ids)
     st.markdown("### 🧢 Captain shortlist")

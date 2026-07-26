@@ -188,6 +188,92 @@ def captain_recommendations(
     ].reset_index(drop=True)
 
 
+def special_gameweeks(bootstrap: dict, fixtures: list[dict], ahead: int = 15) -> pd.DataFrame:
+    """
+    Detect Double/Triple Gameweeks (a team plays 2+/3+ times in one gameweek)
+    and Blank Gameweeks (a team has no fixture while others play) over the next
+    ``ahead`` gameweeks.
+
+    Doubles/blanks arise when the Premier League reschedules matches around cup
+    rounds, so early in a season the fixture list is usually all singles and
+    this returns an empty frame — the specials get confirmed by the FPL API as
+    the season progresses.
+
+    Returns one row per notable gameweek, columns:
+    ``gameweek``, ``type`` (Double/Triple/Blank/Double+Blank…),
+    ``double_teams``, ``triple_teams``, ``blank_teams``.
+    """
+    cols = ["gameweek", "type", "double_teams", "triple_teams", "blank_teams"]
+    if not bootstrap or not fixtures:
+        return pd.DataFrame(columns=cols)
+
+    teams = {t["id"]: t["name"] for t in bootstrap.get("teams", [])}
+    events = bootstrap.get("events", [])
+    current = next((e["id"] for e in events if e.get("is_current")), None)
+    if current is None:
+        current = next((e["id"] for e in events if e.get("is_next")), 1)
+    horizon = set(range(current, current + ahead))
+
+    # gameweek -> {team_id: fixture_count}
+    counts: dict[int, dict[int, int]] = {}
+    for fx in fixtures:
+        gw = fx.get("event")
+        if gw is None or gw not in horizon:
+            continue
+        bucket = counts.setdefault(gw, {})
+        for side in ("team_h", "team_a"):
+            tid = fx.get(side)
+            if tid is not None:
+                bucket[tid] = bucket.get(tid, 0) + 1
+
+    rows = []
+    for gw in sorted(counts):
+        team_counts = counts[gw]
+        if not team_counts:
+            continue
+        doubles = sorted(teams.get(t, "?") for t, c in team_counts.items() if c == 2)
+        triples = sorted(teams.get(t, "?") for t, c in team_counts.items() if c >= 3)
+        # A blank is a team with no fixture in a gameweek that others do play.
+        playing = set(team_counts)
+        blanks = sorted(teams[t] for t in teams if t not in playing)
+
+        if not (doubles or triples or blanks):
+            continue  # a normal all-singles gameweek
+
+        labels = []
+        if triples:
+            labels.append("Triple")
+        if doubles:
+            labels.append("Double")
+        if blanks:
+            labels.append("Blank")
+        rows.append(
+            {
+                "gameweek": gw,
+                "type": " + ".join(labels) + " GW",
+                "double_teams": ", ".join(doubles) if doubles else "—",
+                "triple_teams": ", ".join(triples) if triples else "—",
+                "blank_teams": ", ".join(blanks) if blanks else "—",
+            }
+        )
+    return pd.DataFrame(rows, columns=cols)
+
+
+def next_gameweek_info(bootstrap: dict) -> dict:
+    """Return {'current': id, 'next': id, 'name': str} for display. Empty on failure."""
+    events = bootstrap.get("events", []) if bootstrap else []
+    if not events:
+        return {}
+    current = next((e for e in events if e.get("is_current")), None)
+    nxt = next((e for e in events if e.get("is_next")), None)
+    ref = current or nxt or events[0]
+    return {
+        "current": current["id"] if current else None,
+        "next": nxt["id"] if nxt else None,
+        "name": ref.get("name", "N/A"),
+    }
+
+
 def injury_alerts(bootstrap: dict, squad_ids: set[int] | None = None) -> pd.DataFrame:
     """
     Players flagged as not fully available. Restricted to the manager's squad
