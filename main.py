@@ -89,6 +89,67 @@ def cached_team(team_id: str):
     return data_fetch.fetch_fpl_team(int(team_id)) if team_id.isdigit() else {}
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_backtest():
+    """Out-of-sample backtest of the Premier League model (cached 30 min)."""
+    return model_mod.backtest_model(data_fetch.load_historical(data_fetch.PL_CODE))
+
+
+def build_win_prob(trained, history, boot, fixtures) -> dict:
+    """
+    Map each Premier League team to our model's probability of winning its next
+    fixture, keyed by FPL team name so it can feed the captain scorer. Uses the
+    FPL fixture list (FPL team ids) for the next gameweek. Empty on missing data.
+    """
+    if not boot or not fixtures or trained is None or history is None:
+        return {}
+    teams = {t["id"]: t["name"] for t in boot.get("teams", [])}
+    events = boot.get("events", [])
+    nxt = next((e["id"] for e in events if e.get("is_next")), None)
+    if nxt is None:
+        nxt = next((e["id"] for e in events if e.get("is_current")), None)
+    known = set(history["home_team"]) | set(history["away_team"])
+
+    win_prob: dict[str, float] = {}
+    for fx in fixtures:
+        if fx.get("event") != nxt or fx.get("finished"):
+            continue
+        h_fpl = teams.get(fx.get("team_h"))
+        a_fpl = teams.get(fx.get("team_a"))
+        if not h_fpl or not a_fpl:
+            continue
+        home = _match_team_name(h_fpl, known)
+        away = _match_team_name(a_fpl, known)
+        pred = model_mod.predict_fixture(trained, history, home, away)
+        win_prob[h_fpl] = pred["prob_home"] / 100.0
+        win_prob[a_fpl] = pred["prob_away"] / 100.0
+    return win_prob
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def augmented_pl_history(api_key: str):
+    """
+    Premier League history blended with the current season's finished results
+    (football-data.org), so recent-form features reflect this season. Falls back
+    to the static two-season history if the API is unavailable.
+    """
+    base = data_fetch.load_historical(data_fetch.PL_CODE)
+    if not api_key:
+        return base
+    recent = cached_recent_results(api_key, data_fetch.PL_COMPETITION)
+    if recent.empty:
+        return base
+    # Normalise football-data.org names to the historical (co.uk) naming.
+    known = set(base["home_team"]) | set(base["away_team"])
+    recent = recent.copy()
+    recent["home_team"] = recent["home_team"].apply(lambda n: _match_team_name(n, known))
+    recent["away_team"] = recent["away_team"].apply(lambda n: _match_team_name(n, known))
+    recent["season"] = "current"
+    combined = pd.concat([base, recent], ignore_index=True)
+    combined = combined.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    return combined
+
+
 # --------------------------------------------------------------------------- #
 # First-run setup: download historical data with a progress bar
 # --------------------------------------------------------------------------- #
@@ -221,14 +282,51 @@ def tab_next_gameweek(trained, history, api_key):
 
     df = _predictions_table(trained, history, upcoming)
     st.dataframe(df, use_container_width=True, hide_index=True)
+    _csv_download(df, "Download predictions (CSV)", "next_gameweek_predictions.csv")
     st.caption(
         f"Model trained on {trained.n_matches} matches · "
-        f"training accuracy {trained.accuracy:.1%}. "
-        "Betting odds shown are for comparison only."
+        f"training accuracy {trained.accuracy:.1%}. Recent-form features include "
+        "this season's results when your API key is set. Odds shown for comparison only."
+    )
+
+    # Honest out-of-sample performance
+    with st.expander("📏 How accurate is this model, really? (out-of-sample backtest)"):
+        bt = cached_backtest()
+        if bt.get("accuracy") is None:
+            st.write("Not enough data to backtest.")
+        else:
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Real accuracy", f"{bt['accuracy']*100:.1f}%",
+                      help="On matches the model never saw during training.")
+            b2.metric("Baseline (always home)", f"{bt['baseline']*100:.1f}%")
+            edge = (bt["accuracy"] - bt["baseline"]) * 100
+            b3.metric("Edge over baseline", f"{edge:+.1f} pts")
+            st.caption(
+                f"Walk-forward test on the most recent {bt['n_test']} matches "
+                "(trained only on earlier games). Calibration below — does the "
+                "model's confidence match reality?"
+            )
+            if not bt["calibration"].empty:
+                st.dataframe(
+                    bt["calibration"].rename(columns={
+                        "confidence_bin": "Confidence bin", "n": "Matches",
+                        "predicted_avg": "Model says (%)", "actual_win_rate": "Actually won (%)",
+                    }), use_container_width=True, hide_index=True)
+
+
+def _csv_download(df, label: str, filename: str):
+    """Render a download button for a DataFrame as CSV (no-op if empty)."""
+    if df is None or df.empty:
+        return
+    st.download_button(
+        f"⬇️ {label}",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name=filename,
+        mime="text/csv",
     )
 
 
-def tab_fpl(trained, api_key, team_id):
+def tab_fpl(trained, history, api_key, team_id):
     st.subheader("FPL Recommendations")
     boot = cached_bootstrap()
     fixtures = cached_fixtures()
@@ -248,7 +346,10 @@ def tab_fpl(trained, api_key, team_id):
     else:
         st.info("No FPL team id set — showing generic recommendations.")
 
-    # Double / Blank gameweek radar
+    # Model win-probabilities per team (links the match model to captaincy).
+    win_prob = build_win_prob(trained, history, boot, fixtures)
+
+    # ---- Double / Blank gameweeks + chip hints -------------------------------
     st.markdown("### 📅 Double / Blank Gameweeks (next 15 GWs)")
     gw_info = fpl.next_gameweek_info(boot)
     if gw_info.get("name"):
@@ -264,30 +365,24 @@ def tab_fpl(trained, api_key, team_id):
         dgw = specials[specials["double_teams"] != "—"]
         if not dgw.empty:
             nxt = dgw.iloc[0]
-            st.success(
-                f"⭐ Next Double Gameweek: **GW{nxt['gameweek']}** — "
-                f"{nxt['double_teams']}"
-            )
-        st.dataframe(
-            specials.rename(
-                columns={
-                    "gameweek": "GW", "type": "Type",
-                    "double_teams": "Double (2 games)",
-                    "triple_teams": "Triple (3 games)",
-                    "blank_teams": "Blank (no game)",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.caption(
-            "Double/Triple GWs are strong captaincy & transfer targets; Blank GWs "
-            "are when you may need bench cover or a Free Hit chip."
-        )
+            st.success(f"⭐ Next Double Gameweek: **GW{nxt['gameweek']}** — {nxt['double_teams']}")
+        specials_view = fpl.personal_specials(specials, boot, squad_ids)
+        rename = {
+            "gameweek": "GW", "type": "Type",
+            "double_teams": "Double (2 games)", "triple_teams": "Triple (3 games)",
+            "blank_teams": "Blank (no game)", "your_double_players": "Your players (double)",
+        }
+        st.dataframe(specials_view.rename(columns=rename), use_container_width=True, hide_index=True)
+        for hint in fpl.chip_hints(specials):
+            st.markdown(f"- {hint}")
 
-    # Captain pick
-    caps = fpl.captain_recommendations(boot, fixtures, weeks=8, top_n=8, squad_ids=squad_ids)
+    # ---- Captain shortlist (model-weighted) ----------------------------------
+    caps = fpl.captain_recommendations(
+        boot, fixtures, weeks=8, top_n=8, squad_ids=squad_ids, win_prob=win_prob
+    )
     st.markdown("### 🧢 Captain shortlist")
+    st.caption("Score blends FPL expected points, form, fixture ease, an ownership "
+               "differential bonus, and *our* model's win probability for the team.")
     if caps.empty:
         st.write("N/A — no eligible players found.")
     else:
@@ -295,21 +390,93 @@ def tab_fpl(trained, api_key, team_id):
         c1, c2, c3 = st.columns(3)
         c1.metric("Top captain", f"{top['web_name']}", f"{top['team_name']}")
         c2.metric("Expected pts (next)", f"{top['ep_next']:.1f}")
-        c3.metric("Ownership", f"{top['selected_by_percent']:.1f}%")
+        c3.metric("Model win prob", f"{top['model_win_prob']*100:.0f}%")
         st.dataframe(
             caps.rename(
                 columns={
                     "web_name": "Player", "team_name": "Team", "position": "Pos",
                     "now_cost": "£m", "selected_by_percent": "Owned %",
                     "form": "Form", "ep_next": "xPts", "fixture_ease": "Fixture ease",
-                    "ownership_diff": "Diff bonus", "captain_score": "Score",
+                    "ownership_diff": "Diff bonus", "model_win_prob": "Win prob",
+                    "captain_score": "Score",
                 }
             ),
             use_container_width=True,
             hide_index=True,
         )
+        _csv_download(caps, "Download captain shortlist (CSV)", "captain_shortlist.csv")
 
-    # Fixture difficulty radar
+    # ---- Price-change watch --------------------------------------------------
+    st.markdown("### 💷 Price-change watch (tonight)")
+    st.caption("Ranked by net transfers this gameweek — FPL hides the exact rise/"
+               "fall threshold, so treat as momentum, not a guarantee.")
+    risers, fallers = fpl.price_change_watch(boot, top_n=8)
+    pc1, pc2 = st.columns(2)
+    with pc1:
+        st.markdown("**📈 Likely risers**")
+        if risers.empty or risers["net_transfers_event"].max() == 0:
+            st.write("No transfer momentum yet (pre-season / early).")
+        else:
+            st.dataframe(
+                risers.rename(columns={
+                    "web_name": "Player", "team_name": "Team", "position": "Pos",
+                    "now_cost": "£m", "net_transfers_event": "Net transfers",
+                    "cost_change_event": "Δ£ this GW",
+                }), use_container_width=True, hide_index=True)
+    with pc2:
+        st.markdown("**📉 Likely fallers**")
+        if fallers.empty:
+            st.write("No notable outflows yet.")
+        else:
+            st.dataframe(
+                fallers.rename(columns={
+                    "web_name": "Player", "team_name": "Team", "position": "Pos",
+                    "now_cost": "£m", "net_transfers_event": "Net transfers",
+                    "cost_change_event": "Δ£ this GW",
+                }), use_container_width=True, hide_index=True)
+
+    # ---- Transfer & differential targets -------------------------------------
+    st.markdown("### 🔁 Transfer targets (best value per position)")
+    tt = fpl.transfer_targets(boot, fixtures, weeks=6, top_n=5)
+    if tt.empty:
+        st.write("N/A — player data unavailable.")
+    else:
+        st.dataframe(
+            tt.rename(columns={
+                "web_name": "Player", "team_name": "Team", "position": "Pos",
+                "now_cost": "£m", "form": "Form", "ep_next": "xPts",
+                "selected_by_percent": "Owned %", "value": "xPts/£m",
+                "fixture_ease": "Fixture ease",
+            }), use_container_width=True, hide_index=True)
+        _csv_download(tt, "Download transfer targets (CSV)", "transfer_targets.csv")
+
+    # ---- Expected goals leaders ----------------------------------------------
+    st.markdown("### 📊 Expected goals & assists (xGI leaders)")
+    st.caption("Official FPL expected stats — season totals, so zero until games are played.")
+    xl = fpl.xg_leaders(boot, top_n=10, squad_ids=squad_ids)
+    if xl.empty:
+        st.write("N/A.")
+    else:
+        st.dataframe(
+            xl.rename(columns={
+                "web_name": "Player", "team_name": "Team", "position": "Pos",
+                "xg": "xG", "xa": "xA", "xgi": "xGI", "xgi_per_90": "xGI/90",
+            }), use_container_width=True, hide_index=True)
+
+    # ---- Set-piece & penalty takers ------------------------------------------
+    st.markdown("### 🎯 Penalty & set-piece takers")
+    st.caption("First-choice takers (a big hidden points edge). Penalty takers listed first.")
+    spt = fpl.set_piece_takers(boot, squad_ids=squad_ids)
+    if spt.empty:
+        st.write("None listed" + (" in your squad." if squad_ids else " yet."))
+    else:
+        st.dataframe(
+            spt.rename(columns={
+                "web_name": "Player", "team_name": "Team",
+                "position": "Pos", "duties": "Duties",
+            }), use_container_width=True, hide_index=True)
+
+    # ---- Fixture difficulty: radar + ticker ----------------------------------
     st.markdown("### 🎯 Fixture difficulty (next 8 GWs)")
     fdr = fpl.fixture_difficulty(boot, fixtures, weeks=8)
     if fdr.empty:
@@ -317,22 +484,47 @@ def tab_fpl(trained, api_key, team_id):
     else:
         _render_fdr_radar(fdr, squad_ids, boot)
 
-    # Injury alerts
+    st.markdown("#### 🗓️ Fixture ticker (all teams × next 8 GWs)")
+    st.caption("Each cell: difficulty (1 easy – 5 hard), opponent, (H)ome/(A)way. '—' = blank GW.")
+    ticker = fpl.fixture_ticker(boot, fixtures, weeks=8)
+    if ticker.empty:
+        st.write("N/A.")
+    else:
+        st.dataframe(ticker, use_container_width=True, hide_index=True)
+        _csv_download(ticker, "Download fixture ticker (CSV)", "fixture_ticker.csv")
+
+    # ---- Injury alerts -------------------------------------------------------
     st.markdown("### 🚑 Injury / availability alerts")
     inj = fpl.injury_alerts(boot, squad_ids=squad_ids)
     if inj.empty:
         st.write("No availability concerns" + (" in your squad." if squad_ids else "."))
     else:
         st.dataframe(
-            inj.rename(
-                columns={
-                    "web_name": "Player", "team_name": "Team",
-                    "availability": "Status", "news": "News",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+            inj.rename(columns={
+                "web_name": "Player", "team_name": "Team",
+                "availability": "Status", "news": "News",
+            }), use_container_width=True, hide_index=True)
+
+    # ---- Optimal squad builder -----------------------------------------------
+    st.markdown("### 🧮 Optimal squad builder")
+    budget = st.slider("Budget (£m)", min_value=80.0, max_value=110.0, value=100.0, step=0.5)
+    sq = fpl.optimal_squad(boot, fixtures, budget=budget, weeks=6)
+    if sq["squad"].empty:
+        st.write("N/A — player data unavailable.")
+    else:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Squad cost", f"£{sq['total_cost']}m")
+        m2.metric("Projected pts (next GW)", f"{sq['total_ep']}")
+        m3.metric("Valid 15?", "✅ Yes" if sq["feasible"] else "⚠️ Partial")
+        st.dataframe(
+            sq["squad"].rename(columns={
+                "web_name": "Player", "team_name": "Team", "position": "Pos",
+                "now_cost": "£m", "ep_next": "xPts", "form": "Form",
+                "fixture_ease": "Fixture ease",
+            }), use_container_width=True, hide_index=True)
+        _csv_download(sq["squad"], "Download optimal squad (CSV)", "optimal_squad.csv")
+        st.caption("2 GK · 5 DEF · 5 MID · 3 FWD · max 3 per club. Projection = FPL "
+                   "expected points + recent form + fixture ease.")
 
 
 def tab_all_leagues(models, histories, api_key):
@@ -508,10 +700,11 @@ def main():
     with st.spinner("Loading / training models for all leagues (first run only)…"):
         models, histories = get_all_models()
     trained = models.get(data_fetch.PL_CODE)
-    history = histories.get(data_fetch.PL_CODE)
-    if trained is None or history is None:
+    if trained is None or histories.get(data_fetch.PL_CODE) is None:
         st.error("Premier League model unavailable. Try reloading the page.")
         st.stop()
+    # Blend this season's results into the PL history used for predictions.
+    history = augmented_pl_history(cfg["api_key"])
 
     # Validate API key if provided
     if cfg["api_key"]:
@@ -525,23 +718,16 @@ def main():
     b1, b2, b3 = st.columns(3)
     if b1.button("🔄 Quick Refresh", use_container_width=True):
         do_refresh("quick", cfg["api_key"])
-    if b2.button("🔄 Full Refresh", use_container_width=True, help="Includes xG (placeholder)"):
+    if b2.button("🔄 Full Refresh", use_container_width=True, help="Adds xG-based stats"):
         do_refresh("full", cfg["api_key"])
-    if b3.button("🔄 Heavy Refresh", use_container_width=True, help="Includes injuries (placeholder)"):
+    if b3.button("🔄 Heavy Refresh", use_container_width=True, help="Adds injuries & price watch"):
         do_refresh("heavy", cfg["api_key"])
 
     last = st.session_state.get("last_update")
-    xg_note = "xG data: placeholder"
     if last:
-        st.success(f"Last updated: {last} · level: {st.session_state.get('last_level','—')} · {xg_note}")
+        st.success(f"Last updated: {last} · level: {st.session_state.get('last_level','—')} · xG: live (FPL API)")
     else:
         st.caption("Tip: click a refresh button to pull the latest FPL & fixture data.")
-
-    if st.session_state.get("last_level") in ("full", "heavy"):
-        st.info(
-            "ℹ️ Full/Heavy refresh will add xG (Full) and injury scraping (Heavy) — "
-            "these are placeholders in the MVP and currently behave like Quick refresh."
-        )
 
     tab1, tab2, tab3 = st.tabs(
         ["📅 Next Gameweek", "🏆 FPL Recommendations", "🌍 Predictions (All Leagues)"]
@@ -549,7 +735,7 @@ def main():
     with tab1:
         tab_next_gameweek(trained, history, cfg["api_key"])
     with tab2:
-        tab_fpl(trained, cfg["api_key"], cfg["team_id"])
+        tab_fpl(trained, history, cfg["api_key"], cfg["team_id"])
     with tab3:
         tab_all_leagues(models, histories, cfg["api_key"])
 

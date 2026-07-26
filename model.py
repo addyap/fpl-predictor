@@ -70,6 +70,75 @@ def train_model(historical: pd.DataFrame) -> TrainedModel:
     return TrainedModel(pipeline=pipeline, accuracy=accuracy, n_matches=len(frame))
 
 
+def backtest_model(historical: pd.DataFrame, test_frac: float = 0.3) -> dict:
+    """
+    Honest out-of-sample evaluation via a chronological (walk-forward) split:
+    train on the earliest ``1 - test_frac`` of matches, predict the most recent
+    ``test_frac``, and measure real predictive accuracy — never test data the
+    model has already seen.
+
+    Returns a dict with:
+      - ``accuracy``        : out-of-sample hit rate
+      - ``baseline``        : always-predict-home accuracy on the same test set
+      - ``n_test``          : number of matches evaluated
+      - ``calibration``     : DataFrame of predicted-confidence bins vs actual
+                              win rate (is "60% confident" right ~60% of the time?)
+    Falls back to an empty result if there isn't enough data.
+    """
+    import numpy as np
+
+    frame = build_training_frame(historical)
+    out = {"accuracy": None, "baseline": None, "n_test": 0, "calibration": pd.DataFrame()}
+    if len(frame) < 60:
+        return out
+
+    split = int(len(frame) * (1 - test_frac))
+    train, test = frame.iloc[:split], frame.iloc[split:]
+    if train.empty or test.empty:
+        return out
+
+    pipeline = Pipeline(
+        steps=[
+            ("scale", StandardScaler()),
+            ("clf", LogisticRegression(solver="lbfgs", max_iter=1000, C=1.0)),
+        ]
+    )
+    pipeline.fit(train[FEATURE_COLUMNS].fillna(0.0), train["result"])
+
+    X_test = test[FEATURE_COLUMNS].fillna(0.0)
+    proba = pipeline.predict_proba(X_test)
+    classes = list(pipeline.named_steps["clf"].classes_)
+    preds = [classes[i] for i in proba.argmax(axis=1)]
+    actual = test["result"].tolist()
+
+    correct = sum(p == a for p, a in zip(preds, actual))
+    out["accuracy"] = round(correct / len(actual), 3)
+    out["baseline"] = round(sum(a == "H" for a in actual) / len(actual), 3)
+    out["n_test"] = len(actual)
+
+    # Calibration: bin by the model's top-choice confidence, compare to reality.
+    conf = proba.max(axis=1)
+    hit = np.array([p == a for p, a in zip(preds, actual)])
+    bins = [0.33, 0.45, 0.55, 0.65, 1.01]
+    labels = ["33–45%", "45–55%", "55–65%", "65%+"]
+    rows = []
+    for i in range(len(bins) - 1):
+        mask = (conf >= bins[i]) & (conf < bins[i + 1])
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        rows.append(
+            {
+                "confidence_bin": labels[i],
+                "n": n,
+                "predicted_avg": round(float(conf[mask].mean()) * 100, 1),
+                "actual_win_rate": round(float(hit[mask].mean()) * 100, 1),
+            }
+        )
+    out["calibration"] = pd.DataFrame(rows)
+    return out
+
+
 def predict_fixture(
     model: TrainedModel, historical: pd.DataFrame, home: str, away: str
 ) -> dict:
