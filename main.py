@@ -701,6 +701,14 @@ def tab_all_leagues(models, histories, api_key):
         f"(football-data.org free tier) · {len(ranked_only)} shown as model-based "
         "power rankings (no live fixture feed on the free tier)."
     )
+    st.warning(
+        "ℹ️ **Power rankings below reflect each league's last completed season "
+        "(2025/26)** — the newest season with actual played results. The upcoming "
+        "2025/26 → 2026/27 promotions and relegations are **not** reflected here, so a "
+        "team that went up or down will still appear in its 2025/26 division until the "
+        "new season is played. Fixture predictions (above, where shown) are for the "
+        "current 2026/27 season."
+    )
 
     if not api_key:
         st.warning(
@@ -744,7 +752,12 @@ def tab_all_leagues(models, histories, api_key):
 
             # Always show the power ranking; for non-live leagues it's the main view.
             ranking = features.team_strength_table(history)
-            st.markdown("**Team power ranking** (last 10 games)")
+            seasons = sorted(history["season"].dropna().unique()) if "season" in history else []
+            season_label = seasons[-1] if seasons else "last season"
+            st.markdown(
+                f"**Team power ranking — {season_label} final standings** "
+                "(last 10 games; new-season promotions/relegations not yet reflected)"
+            )
             if ranking.empty:
                 st.write("N/A")
             else:
