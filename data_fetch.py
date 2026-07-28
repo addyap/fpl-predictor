@@ -27,9 +27,12 @@ import requests
 # --------------------------------------------------------------------------- #
 
 # football-data.co.uk premier-league CSVs. E0 == English Premier League.
-# Season codes are the two-year form, e.g. 2324 == 2023/24.
+# Season codes are the two-year form, e.g. 2526 == 2025/26.
 FOOTBALL_DATA_CO_UK = "https://www.football-data.co.uk/mmz4281/{season}/{code}.csv"
-HISTORICAL_SEASONS = ["2324", "2425"]  # 2023/24 + 2024/25
+HISTORICAL_SEASONS = ["2425", "2526"]  # two most recent completed seasons
+# Tag derived from the season list so changing seasons invalidates cached CSVs
+# (old files have a different name and are simply re-downloaded).
+SEASON_TAG = "".join(HISTORICAL_SEASONS)
 
 # football-data.org v4 REST API
 FOOTBALL_DATA_ORG = "https://api.football-data.org/v4"
@@ -84,8 +87,12 @@ def get_league(code: str) -> dict:
 
 
 def historical_path(code: str) -> str:
-    """Filesystem path of the cached historical CSV for a league code."""
-    return os.path.join(DATA_DIR, f"historical_{code}.csv")
+    """
+    Filesystem path of the cached historical CSV for a league code. The season
+    tag is baked into the filename so bumping HISTORICAL_SEASONS transparently
+    invalidates old caches (they no longer match and get re-downloaded).
+    """
+    return os.path.join(DATA_DIR, f"historical_{code}_{SEASON_TAG}.csv")
 
 # The subset of football-data.co.uk columns we actually need. Keeping this
 # explicit means a schema change upstream fails loudly rather than silently
@@ -153,10 +160,19 @@ def download_historical(
             print(f"[data_fetch] failed to download {url}: {exc}")
             continue
 
-        try:
-            raw = pd.read_csv(io.StringIO(resp.text), encoding="latin-1")
-        except Exception as exc:  # malformed CSV
-            print(f"[data_fetch] failed to parse {url}: {exc}")
+        # football-data.co.uk mixes encodings across files (some UTF-8, some
+        # Windows-1252). Decode from raw bytes trying the likeliest first so
+        # accented names (e.g. "Preußen Münster") come through intact.
+        raw = None
+        for enc in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                raw = pd.read_csv(io.BytesIO(resp.content), encoding=enc)
+                break
+            except Exception:  # wrong encoding or parse error — try the next
+                raw = None
+                continue
+        if raw is None:
+            print(f"[data_fetch] failed to parse {url}")
             continue
 
         keep = {**CORE_COLUMNS, **{k: v for k, v in ODDS_COLUMNS.items() if k in raw.columns}}

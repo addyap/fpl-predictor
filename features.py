@@ -210,6 +210,13 @@ def team_strength_table(df: pd.DataFrame, last_n: int = 10) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=cols)
 
+    # Use only the most recent season so a division's ranking reflects the teams
+    # that actually play in it now — otherwise promoted/relegated sides show up
+    # in last season's division (e.g. Wrexham lingering in League Two).
+    if "season" in df.columns and df["season"].notna().any():
+        latest = sorted(df["season"].dropna().unique())[-1]
+        df = df[df["season"] == latest]
+
     team_hist = _team_match_history(df)
     rows = []
     for team, hist in team_hist.items():

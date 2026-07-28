@@ -340,6 +340,16 @@ def tab_next_gameweek(trained, history, api_key):
         st.info("No upcoming fixtures returned. Check your API key, or try again shortly.")
         return
 
+    # Be transparent about the fixture source & season (comes from football-data.org).
+    kicks = upcoming["utc_date"].dropna()
+    if not kicks.empty:
+        first = _fmt_date(kicks.iloc[0])
+        st.caption(
+            f"Upcoming fixtures from football-data.org (first kickoff {first}). Teams new "
+            "to the top flight this season have limited top-division history, so their "
+            "predictions lean on league-average priors until results accrue."
+        )
+
     df = _predictions_table(trained, history, upcoming)
     st.dataframe(df, use_container_width=True, hide_index=True)
     _csv_download(df, "Download predictions (CSV)", "next_gameweek_predictions.csv")
